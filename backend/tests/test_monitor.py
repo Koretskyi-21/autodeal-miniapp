@@ -633,7 +633,7 @@ def test_ageing_comparisons_refresh_even_when_candidate_price_is_still_fresh(p):
     finally:
         source.release()
     p.ads["124"] = p.clock[0] + 1
-    wake(p, 890)
+    wake(p, 3590)
     p.runner.tick()
     p.runner.tick()
     with Session(p.engine) as db:

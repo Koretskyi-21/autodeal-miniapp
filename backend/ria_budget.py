@@ -5,6 +5,12 @@ from dataclasses import dataclass
 TOTAL_OVERRIDE_ID = "auto-ria-total-cap-v1"
 
 
+def background_limits(limits):
+    """Leave 10% of rolling hourly/daily capacity for interactive operations."""
+    return BudgetLimits(max(1, limits.hourly * 9 // 10),
+                        max(1, limits.daily * 9 // 10), limits.total)
+
+
 def total_cap(db, limits=None):
     """Durable owner-confirmed ceiling, without resetting any request counts.
 

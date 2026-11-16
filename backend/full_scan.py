@@ -7,6 +7,8 @@ Only authenticated POST/PATCH requests start/resume work; reading progress is fr
 import asyncio
 import copy
 import logging
+import hashlib
+import json
 import time
 import uuid
 
@@ -15,7 +17,8 @@ from sqlalchemy.orm import Session
 
 from .auto_ria import RiaError
 from . import market_cache, paid_source_access
-from .models import Filters, FullScan, MarketCar, ScanItem
+from .models import Filters, FullScan, MarketCar, ScanItem, SourceBudget
+from .cost_settings import completed_scan_reuse
 from .ria_search import FRESH_SECONDS, PAGE_REQUEST_LIMIT, RiaSearch, estimate, matches, parse_ids, quota_status
 from .valuation import is_deal
 from .monitor import access_allowed_clause, bind_source_access
@@ -30,6 +33,82 @@ log = logging.getLogger(__name__)
 ACTIVE = ("queued", "running", "waiting")
 PAGE_SIZE = 50
 LEASE_SECONDS = 90
+
+
+def fingerprint(filters):
+    data = filters.canonical()
+    for key in ("brand", "model", "region"):
+        if isinstance(data[key], str):
+            data[key] = " ".join(data[key].casefold().split())
+        else:
+            data[key] = sorted({" ".join(v.casefold().split()) for v in data[key]})
+    data["onlyDeals"] = False
+    return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+
+
+def serialize(db):
+    # A short database write lock also serializes SQLite workers. PostgreSQL
+    # locks this singleton row; no HTTP happens in this transaction.
+    db.execute(update(SourceBudget).where(SourceBudget.id == "auto_ria").values(total=SourceBudget.total))
+
+
+def reuse_completed(db, row, now):
+    cutoff = (row.context or {}).get("fresh_after", 0)
+    query = select(FullScan).where(
+        FullScan.id != row.id, FullScan.fingerprint == row.fingerprint,
+        FullScan.status == "completed", FullScan.updated_at > now - completed_scan_reuse(),
+        func.coalesce(FullScan.context["enumeration_started_at"].as_float(), FullScan.created_at) >= cutoff
+        )
+    if row.discovered:
+        # A resumed partial scan may join completion of its adopted generation,
+        # but must not mix pagination snapshots from independent enumerations.
+        query = query.where(func.coalesce(FullScan.context["enumeration_started_at"].as_float(), FullScan.created_at)
+                            == row.context.get("enumeration_started_at", row.created_at))
+    donor = db.scalar(query.order_by(FullScan.updated_at.desc()).limit(1))
+    if donor is None:
+        return False
+    copy_progress(db, row, donor)
+    row.status, row.error, row.owner, row.lease_until = "completed", "", "", 0
+    return True
+
+
+def copy_progress(db, row, donor):
+    # Copy public derived data into a private result, retaining observation
+    # timestamps. Never share user identifiers, access rights or result cursors.
+    existing = {item.source_id: item for item in db.scalars(select(ScanItem).where(ScanItem.scan_id == row.id))}
+    for item in db.scalars(select(ScanItem).where(ScanItem.scan_id == donor.id).order_by(ScanItem.id)):
+        values = {key: copy.deepcopy(getattr(item, key)) for key in
+                  ("source_id", "state", "car", "deal", "valued", "checked_at")}
+        prior = existing.get(item.source_id)
+        if prior is None:
+            prior = ScanItem(scan_id=row.id, **values)
+            db.add(prior)
+            existing[item.source_id] = prior
+        elif prior.checked_at <= item.checked_at:
+            for key, value in values.items():
+                setattr(prior, key, value)
+    for key in ("context", "source_total", "discovered", "checked", "unavailable", "updated_at"):
+        setattr(row, key, copy.deepcopy(getattr(donor, key)))
+    row.context = {**row.context, "enumeration_started_at":
+                   donor.context.get("enumeration_started_at", donor.created_at)}
+    row.discovered = len(existing)
+    row.checked = sum(item.state != "pending" for item in existing.values())
+    row.unavailable = sum(item.state == "unavailable" for item in existing.values())
+
+
+def reuse_paused(db, row, now):
+    """Resume committed public progress without inheriting the donor's access."""
+    if row.discovered:
+        return
+    donor = db.scalar(select(FullScan).where(
+        FullScan.id != row.id, FullScan.fingerprint == row.fingerprint,
+        FullScan.status == "paused", FullScan.lease_until <= now, FullScan.discovered > 0,
+        FullScan.updated_at > now - completed_scan_reuse(),
+        func.coalesce(FullScan.context["enumeration_started_at"].as_float(), FullScan.created_at)
+            >= (row.context or {}).get("fresh_after", 0))
+        .order_by(FullScan.discovered.desc(), FullScan.checked.desc()).limit(1))
+    if donor is not None:
+        copy_progress(db, row, donor)
 
 
 def pause_all(engine):
@@ -48,8 +127,14 @@ def runtime_status(engine, enabled):
 def start(db, uid, filters, restart=False):
     """Caller holds the user's row lock, serializing starts across browser tabs."""
     filters = filters.model_copy(update={"onlyDeals": False})
-    fingerprint = filters.fingerprint()
-    row = db.scalar(select(FullScan).where(FullScan.user_id == uid, FullScan.fingerprint == fingerprint))
+    serialize(db)
+    scan_fingerprint = fingerprint(filters)
+    row = db.scalar(select(FullScan).where(FullScan.user_id == uid, FullScan.fingerprint == scan_fingerprint))
+    if row is None:
+        row = db.scalar(select(FullScan).where(FullScan.user_id == uid, FullScan.fingerprint == filters.fingerprint()))
+        if row is not None:
+            row.fingerprint = scan_fingerprint
+            db.flush()
     if row is None and db.scalar(select(func.count()).select_from(FullScan).where(FullScan.user_id == uid)) >= 20:
         # These are derived results, not saved subscriptions. Evict only the oldest
         # inactive scan; never delete a running job or touch the user's searches.
@@ -58,16 +143,19 @@ def start(db, uid, filters, restart=False):
         if old:
             db.execute(delete(ScanItem).where(ScanItem.scan_id == old.id))
             db.delete(old)
-    db.execute(update(FullScan).where(FullScan.user_id == uid, FullScan.fingerprint != fingerprint,
+    db.execute(update(FullScan).where(FullScan.user_id == uid, FullScan.fingerprint != scan_fingerprint,
                                       FullScan.status.in_(ACTIVE)).values(status="paused"))
     now = time.time()
     if row is None:
-        row = FullScan(id=uuid.uuid4().hex, user_id=uid, fingerprint=fingerprint,
-                       generation=uuid.uuid4().hex, filters=filters.canonical(), created_at=now, updated_at=now)
+        row = FullScan(id=uuid.uuid4().hex, user_id=uid, fingerprint=scan_fingerprint,
+                       generation=uuid.uuid4().hex, filters=filters.canonical(), created_at=now, updated_at=now,
+                       context={"fresh_after": now} if restart else {})
         db.add(row)
-    elif restart or (row.status == "completed" and now - row.updated_at >= FRESH_SECONDS):
+    elif restart or (row.status == "completed" and now - row.updated_at >= completed_scan_reuse()):
         db.execute(delete(ScanItem).where(ScanItem.scan_id == row.id))
         row.generation, row.context = uuid.uuid4().hex, {}
+        if restart:
+            row.context = {"fresh_after": now}
         row.source_total = row.discovered = row.checked = row.unavailable = row.requests = 0
         row.owner, row.lease_until = "", 0
         row.created_at = now
@@ -77,6 +165,9 @@ def start(db, uid, filters, restart=False):
     if row.status != "completed":
         row.updated_at = now
     db.flush()
+    if row.status != "completed" and not restart and not row.discovered:
+        reuse_completed(db, row, now)
+        db.flush()
     return row.id
 
 
@@ -144,7 +235,8 @@ def view(db, uid, scan_id, after=0, only_deals=False, cache_after=0):
             "retry_after_seconds": max(0, int(row.next_run - now)),
             "after": records[min(len(records), 100) - 1].id if records else after,
             "more_results": len(records) > 100, "complete": row.status == "completed",
-            "warnings": [row.error] if row.error else [], "stale": False,
+            "warnings": [row.error] if row.error else [],
+            "stale": row.status == "completed" and now - row.updated_at >= completed_scan_reuse(),
             "source": "AUTO.RIA", "source_url": "https://auto.ria.com/"}
 
 
@@ -157,11 +249,29 @@ class Scanner:
     def claim(self):
         now = time.time()
         with Session(self.engine) as db:
-            row = db.scalar(select(FullScan).where(FullScan.status.in_(ACTIVE), FullScan.next_run <= now,
+            serialize(db)
+            rows = list(db.scalars(select(FullScan).where(FullScan.status.in_(ACTIVE), FullScan.next_run <= now,
                                                     FullScan.lease_until <= now,
                                                     scan_access(self.engine, FullScan.user_id, now))
-                            .order_by(FullScan.next_run, FullScan.updated_at).limit(1))
+                            .order_by(FullScan.created_at, FullScan.id)))
+            row = None
+            for candidate in rows:
+                if reuse_completed(db, candidate, now):
+                    continue
+                cutoff = (candidate.context or {}).get("fresh_after", 0)
+                earlier = db.scalar(select(FullScan.id).where(
+                    FullScan.fingerprint == candidate.fingerprint, FullScan.id != candidate.id,
+                    FullScan.status.in_(ACTIVE),
+                    func.coalesce(FullScan.context["enumeration_started_at"].as_float(), FullScan.created_at) >= cutoff,
+                    scan_access(self.engine, FullScan.user_id, now),
+                    (FullScan.lease_until > now) | (FullScan.created_at < candidate.created_at) |
+                    ((FullScan.created_at == candidate.created_at) & (FullScan.id < candidate.id))).limit(1))
+                if earlier is None:
+                    reuse_paused(db, candidate, now)
+                    row = candidate
+                    break
             if row is None:
+                db.commit()
                 return None
             scan_id = row.id
             result = db.execute(update(FullScan).where(FullScan.id == scan_id, FullScan.status.in_(ACTIVE),
@@ -203,7 +313,7 @@ class Scanner:
             else:
                 context = {**context, "page": context["page"] + 1,
                            "enumerated": context["page"] * PAGE_SIZE + len(source_ids) >= result["total"]}
-            row.context, row.updated_at = context, time.time()
+            row.context, row.updated_at = {**context, "transient_failures": 0}, time.time()
             db.commit()
         return True
 
@@ -214,9 +324,9 @@ class Scanner:
                 return
             filters = Filters.model_validate(row.filters)
             context = copy.deepcopy(row.context)
-        if not context:
+        if "params" not in context:
             params, ids = source.parameters(filters)
-            context = {"params": params, "ids": ids, "page": 0, "enumerated": False}
+            context = {**context, "params": params, "ids": ids, "page": 0, "enumerated": False}
             with Session(self.engine) as db:
                 row = self.current(db, scan_id)
                 if row is None:
@@ -286,6 +396,7 @@ class Scanner:
                 row.checked += 1
                 row.unavailable += int(state == "unavailable")
                 row.error, row.updated_at = "", time.time()
+                row.context = {**row.context, "transient_failures": 0}
                 db.commit()
             preview_checked = True
 
@@ -336,7 +447,10 @@ class Scanner:
                         elif reason in ("busy", "search_limit"):
                             row.next_run = time.time() + (5 if reason == "busy" else 2)
                         elif reason in ("connection_error", "upstream_error", "source_unavailable"):
-                            row.status, row.error, row.next_run = "waiting", reason, time.time() + 60
+                            failures = min(5, row.context.get("transient_failures", 0) + 1)
+                            row.context = {**row.context, "transient_failures": failures}
+                            row.status, row.error = "waiting", reason
+                            row.next_run = time.time() + min(900, 60 * 2 ** (failures - 1))
                         elif reason == "no_eligible_subscription":
                             # Keep progress intact. Claiming remains blocked until
                             # the user's existing access policy permits work again.

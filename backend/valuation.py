@@ -5,6 +5,7 @@ import math
 import re
 import statistics
 import time
+from .cost_settings import peer_ttl
 from decimal import Decimal
 
 VERSION = "asking-v5"
@@ -92,7 +93,7 @@ def group_key(car):
     return hashlib.sha256(json.dumps([dimensions, values]).encode()).hexdigest()
 
 
-def reasons(car, now, dimensions=None):
+def reasons(car, now, dimensions=None, *, max_age=MAX_AGE):
     result = []
     if car.get("comparable_condition") is not True:
         result.append("unverified_condition")
@@ -104,7 +105,7 @@ def reasons(car, now, dimensions=None):
         result.append("invalid_year")
     if not number(car.get("mileage")):
         result.append("invalid_mileage")
-    if not number(car.get("observed_at"), positive=True) or not -30 <= now - car["observed_at"] <= MAX_AGE:
+    if not number(car.get("observed_at"), positive=True) or not -30 <= now - car["observed_at"] <= max_age:
         result.append("stale_details")
     return result
 
@@ -117,7 +118,7 @@ def comparable(candidate, peer, now):
     if ("modification_id" in dimensions and not peer.get("modification_id")
             and type(candidate.get("engine_cc")) is int and candidate["engine_cc"] > 0):
         dimensions = (*BASE_DIMENSIONS, "engine_cc")
-    rejected = reasons(peer, now, dimensions)
+    rejected = reasons(peer, now, dimensions, max_age=peer_ttl())
     rejected.extend(key for key in dimensions if peer.get(key) != candidate.get(key))
     # Even in engine comparisons, conflicting known modifications stay apart.
     if candidate.get("modification_id") and peer.get("modification_id") and candidate["modification_id"] != peer["modification_id"]:
@@ -172,6 +173,10 @@ def estimate(candidate, peers, *, now=None):
             fingerprints.add(fingerprint)
         accepted.append(peer)
     evidence["peers"] = [{key: peer.get(key) for key in FIELDS} for peer in accepted]
+    oldest_age = max((max(0, now - peer["observed_at"]) for peer in accepted), default=0)
+    evidence.update(oldest_peer_age_seconds=oldest_age,
+                    observation_freshness=max(0, 1 - oldest_age / peer_ttl()),
+                    confidence="aged_observations" if oldest_age > MAX_AGE else "recent_observations")
     if candidate.get("modification_id") and any(not peer.get("modification_id") for peer in accepted):
         evidence["comparison_basis"] = "modification_with_engine_fallback"
     prices = [peer["price_usd"] for peer in accepted]
@@ -273,7 +278,7 @@ def policy():
             "notification_repair_condition": "disclosed_not_excluded",
             "notification_other_exclusions": ["abroad", "custom"],
             "year_tolerance": 1, "mileage_tolerance_percent": 20, "mileage_tolerance_min_km": 30000,
-            "maximum_detail_age_seconds": MAX_AGE, "sample_max_price_ratio": 2,
+              "maximum_detail_age_seconds": MAX_AGE, "maximum_peer_age_seconds": peer_ttl(), "sample_max_price_ratio": 2,
             "user_price_and_region_affect_estimate": False,
             "reference_estimate": {"version": "reference-v4", "minimum_comparables": 3, **PRICING_METHOD,
                 "confidence": "indicative", "known_attributes_must_match": True,

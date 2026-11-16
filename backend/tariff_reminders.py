@@ -322,6 +322,8 @@ def log_progress(engine, settings, outcome):
     try:
         with Session(engine) as db, db.begin():
             if db.get_bind().dialect.name == "postgresql":
+                # Avoid JIT compilation dominating this small aggregate snapshot.
+                db.execute(text("SET LOCAL jit = off"))
                 db.execute(text("SET LOCAL statement_timeout = '3000ms'"))
             data = snapshot(db, settings, time.time())
         data.pop("text")

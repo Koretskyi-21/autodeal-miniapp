@@ -9,6 +9,8 @@ import logging
 import math
 import threading
 import time
+from .cost_settings import peer_ttl
+from .ria_budget import background_limits
 import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -40,7 +42,7 @@ LEASE = 120
 PAGE_SIZE = 50
 WINDOW_SECONDS = 3600
 INDEX_OVERLAP = 600
-EVIDENCE_SECONDS = 60
+EVIDENCE_SECONDS = 300
 DETAIL_TRANSIENT_ERRORS = frozenset({"connection_error", "upstream_error", "invalid_response"})
 DETAIL_FAILURE_LIMIT = 5
 OPTIONAL_DETAIL_FIELDS = ("body_id", "fuel_id", "gear_id", "mileage")
@@ -272,7 +274,8 @@ class Monitor:
         """Wake only quota waits after all actual budget gates are available."""
         budget = db.get(SourceBudget, 'auto_ria')
         now = time.time()
-        if not self.owned(db) or budget is None or budget_state(budget, now, db=db)['reason'] != 'available':
+        if (not self.owned(db) or budget is None or
+                budget_state(budget, now, background_limits(BudgetLimits.env()), db=db)['reason'] != 'available'):
             return
         changed = set()
         for feed in db.scalars(select(MonitorFeed).where(MonitorFeed.id.in_(groups),
@@ -632,7 +635,14 @@ class Monitor:
         candidate = evidence.get("candidate")
         reusable = bool(candidate and "condition_exclusions" in candidate
                         and 0 <= time.time() - candidate["observed_at"] <= EVIDENCE_SECONDS)
+        if reusable:
+            from .peer_cache import evidence_current
+            with Session(self.engine) as db:
+                reusable = evidence_current(db, {"version": REFERENCE_VERSION,
+                    "candidate": candidate, "peers": []})
         if not reusable:
+            # A manual-search cache cannot authorize a notification. Missing or
+            # expired monitor evidence (including a delivery refresh) needs HTTP.
             candidate = source.car(source_id, force=True)
             # Only a successful detail result resets consecutive detail failures.
             # A later catalog/quote failure cannot turn them into repeated misses.
@@ -666,7 +676,12 @@ class Monitor:
         rating = evidence.get("rating", {})
         proof = rating.get("valuation_evidence") or {}
         reusable_rating = (rating.get("valuation_version") in {VERSION, REFERENCE_VERSION}
-            and all(-30 <= time.time() - peer["observed_at"] <= MAX_AGE for peer in proof.get("peers", [])))
+            and proof.get("candidate") is not None
+            and all(-30 <= time.time() - peer["observed_at"] <= peer_ttl() for peer in proof.get("peers", [])))
+        if reusable_rating:
+            from .peer_cache import evidence_current
+            with Session(self.engine) as db:
+                reusable_rating = evidence_current(db, proof)
         if self.settings.ria_ai_price_enabled:
             reusable_rating = (rating.get("valuation_version") == ria_market_range.VERSION
                 and ria_market_range.range_valid(proof.get("source_range"), source_id, time.time())
@@ -723,7 +738,7 @@ class Monitor:
         self.complete(source_id, evidence, outcome)
 
     def defer(self, kind, key, reason, limits, *, stage=None):
-        quota = quota_status(self.engine, limits)
+        quota = quota_status(self.engine, background_limits(limits))
         wait = (quota["retry_after_seconds"] or 3600) if reason == "quota_exceeded" else (
             1 if reason in {"busy", "search_limit"} else INTERVAL)
         with self._state_lock, Session(self.engine) as db:

@@ -73,7 +73,7 @@ def test_newest_observation_wins_and_stale_or_future_details_are_unknown():
     old = {**peers[0], "observed_at": now - 901, "price_usd": 30000}
     assert estimate(candidate, [*peers, old], now=now)["market"] == 10000
     assert estimate(candidate, [old, *peers], now=now)["market"] == 10000
-    for stamp in (now - 901, now + 31):
+    for stamp in (now - 3601, now + 31):
         rating = estimate(candidate, [*peers[:-1], {**peers[-1], "observed_at": stamp}], now=now)
         assert rating["assessment"] == "unknown" and rating["comparables"] == 4
         assert "stale_details" in rating["valuation_evidence"]["rejected"][0]["reasons"]
@@ -109,7 +109,7 @@ def test_delivery_requires_consistent_evidence_and_fresh_peer_prices():
     candidate, peers = sample()
     now = time.time()
     for peer in peers:
-        peer["observed_at"] = now - 890
+        peer["observed_at"] = now - 3590
     rating = estimate(candidate, peers, now=now)
     car = delivery_car(source_id=candidate["id"], source="auto_ria", price=candidate["price_usd"],
         market=rating["market"], year=candidate["year"], mileage=candidate["mileage"],
@@ -181,7 +181,7 @@ def test_pool_observations_expire_and_sold_or_changed_details_cannot_return(engi
         # Equal timestamp tombstones also win over old cached detail.
         with pytest.raises(RiaError, match="listing_unavailable"):
             peer_cache.observe(engine, {**prior, "observed_at": clock[0]})
-        clock[0] += 901
+        clock[0] += 3601
         assert not peer_cache.candidates(engine, {**candidate, "observed_at": clock[0]})
     finally:
         source.release()

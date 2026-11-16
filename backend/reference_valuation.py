@@ -4,6 +4,7 @@ Only real, fresh peer observations are used. This is a broader comparison, not
 an assertion that missing equipment/condition matches or that a sale is a bargain.
 """
 import time
+from .cost_settings import peer_ttl
 
 from .valuation import (FIELDS, MAX_AGE, PRICING_METHOD, PeerBatch, estimate as exact_estimate,
                         is_deal, number, price_statistics, notification_condition_allowed, repair_notices)
@@ -32,7 +33,7 @@ def reasons(car, now, *, peer=False):
         result.append("invalid_price")
     if type(car.get("year")) is not int or not 1900 <= car["year"] <= 2100:
         result.append("invalid_year")
-    if not number(car.get("observed_at"), positive=True) or not -30 <= now - car["observed_at"] <= MAX_AGE:
+    if not number(car.get("observed_at"), positive=True) or not -30 <= now - car["observed_at"] <= (peer_ttl() if peer else MAX_AGE):
         result.append("stale_details")
     # Unknown condition on the candidate is disclosed, never interpreted as good.
     # Peer prices must come from explicitly eligible source-condition observations.
@@ -127,6 +128,10 @@ def estimate(candidate, peers, *, now=None):
         evidence["reference_kind"] = "lower_price_band"
     market = evidence["lower_quartile_usd"]
     evidence["oldest_peer_at"] = min(peer["observed_at"] for peer in accepted)
+    age = max(0, now - evidence["oldest_peer_at"])
+    evidence.update(oldest_peer_age_seconds=age,
+                    observation_freshness=max(0, 1 - age / peer_ttl()),
+                    observation_confidence="aged" if age > MAX_AGE else "recent")
     return {**result, "market": market, "discount": round((1 - candidate["price_usd"] / market) * 100, 1),
             "valuation": "reference_lower_quartile", "valuation_reasons": [],
             "assessment": "estimated_deal" if is_deal(candidate["price_usd"], market) else "estimated_not_deal"}

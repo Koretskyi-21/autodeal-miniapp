@@ -1517,3 +1517,53 @@ owner scope and command age are checked before lookup. The shared reply sender
 claims before HTTP and never retries uncertain/crashed sends; explicit Telegram
 429 rejection retains its existing bounded retry. No database migration or
 environment change is required. No artificial live diagnostic messages are sent.
+
+## API cost controls
+
+`COMPLETED_SCAN_REUSE_SECONDS=3600` reuses completed equivalent full scans
+across users (allowed range 3600–86400). Each user retains a private scan ID,
+pause state and pagination cursor. Equivalent active scans elect one worker via
+a short database transaction; followers copy the completed public results.
+The existing scan POST `restart=true` starts a fresh discovery generation.
+It re-enumerates pages to find new IDs while retaining valid listing-detail caches.
+Incomplete scans are never reused as complete coverage. Pausing or losing access
+to a leader lets another eligible user's scan proceed independently. Committed
+progress from a paused scan can be adopted without inheriting its user's access.
+
+`RIA_PEER_CACHE_TTL_SECONDS=3600` controls comparable observations only
+(1800–3600). Listing-detail freshness remains 900 seconds; notification candidate
+evidence is limited to 300 seconds and a delivery refresh still fetches fresh
+details. Known changed or unavailable peers invalidate existing evidence.
+Valuation evidence includes oldest-observation age and a freshness indicator;
+older observations do not become new observations when reused. Comparable search
+responses use the peer TTL; catalogs retain their existing seven-day policy.
+
+`RIA_ACTIVE_WINDOW_ENABLED=false` retains the existing opt-in supplemental
+discovery feature. `RIA_ACTIVE_WINDOW_INTERVAL_SECONDS=300` sets its polling
+interval (60–86400). The default stays at five minutes: seven continuously active
+groups would use at most 2016 first-page requests/day, versus 10080 at one minute.
+These are schedule estimates, excluding primary publication discovery and details.
+Disabling this supplement does not disable essential publication discovery.
+Invalid settings fail application startup; worker processes must use the same
+environment configuration.
+
+All normal requests and the once-only connection probe use the shared durable
+budget and provider lease. Existing hourly, daily and lifetime caps remain in
+effect; background requests additionally leave 10% of hourly/daily capacity for
+user operations. Supplemental work retains its stricter existing reserve.
+Budget-blocked monitoring waits for the relevant rolling window; failed detail
+requests retain their bounded retry policy. Full-scan transient retries back off
+from 60 seconds to 15 minutes, resetting after successful progress.
+
+The authenticated `GET /api/admin/api-usage?after=UNIX_SECONDS&before=UNIX_SECONDS`
+report accepts a half-open period of at most 31 days. It requires both the existing
+Telegram identity check and a verified administrator (`ADMIN_TELEGRAM_ID` must
+match `SUBSCRIPTION_EXPECTED_ADMIN_ID`). UTC hourly/daily buckets, request
+categories, authorization reasons, initiators, forced calls and repeat relations
+are aggregates; credentials, user IDs and raw request parameters are excluded.
+Local reservations, dispatched operations and observed HTTP attempts are separate
+metrics. Provider-billed units and cache hit/miss totals are unknown, not inferred.
+The historical two-request budget seed remains unchanged and is not presented as
+observed HTTP usage. Apply `migrations/20261111_scan_reuse_index.sql` before
+rollout to index shared scan lookups on existing databases. No table/column or
+data migration and no new dependencies are required.

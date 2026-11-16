@@ -78,7 +78,7 @@ def test_reference_rejects_missing_core_data_adverse_condition_stale_and_duplica
     peers[1]["vehicle_key"] = peers[0]["vehicle_key"] = "same-hashed-vehicle"
     assert estimate(candidate, peers[:3])["market"] is None
     peers = sample()[1][:3]
-    peers[-1]["observed_at"] -= 901
+    peers[-1]["observed_at"] -= 3601
     assert estimate(candidate, peers)["market"] is None
     assert estimate(candidate, [{**p, "observed_at": candidate["observed_at"] + 31} for p in peers])["market"] is None
 

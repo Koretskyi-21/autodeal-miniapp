@@ -11,7 +11,7 @@ import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 
-from sqlalchemy import Boolean, Float, Index, Integer, String, func, select
+from sqlalchemy import Boolean, Float, Index, Integer, String, cast, func, select
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from .models import Base
@@ -68,9 +68,41 @@ class RiaApiAuthorization(Base):
     group_fingerprint: Mapped[str] = mapped_column(String(64))
 
 
-REASONS = frozenset({"publication_search", "candidate_evaluation", "active_window_search",
+REASONS = frozenset({"connection_check", "publication_search", "candidate_evaluation", "active_window_search",
     "recent_publication_validation", "user_requested_scan", "authenticated_search",
     "authenticated_catalog", "paid_receipt_photo_repair", "owner_source_discrepancy"})
+USER_REASONS = frozenset({"user_requested_scan", "authenticated_search", "authenticated_catalog",
+                         "paid_receipt_photo_repair", "owner_source_discrepancy"})
+
+
+def usage_report(db, after, before):
+    report = summary(db, after, before)
+    criteria = (RiaApiAttempt.reserved_at >= after, RiaApiAttempt.reserved_at < before)
+    def buckets(column, size):
+        bucket = cast(func.floor(column / size), Integer) * size
+        return [{"utc_start": start, "count": count} for start, count in db.execute(
+            select(bucket, func.count()).where(column >= after, column < before)
+            .group_by(bucket).order_by(bucket))]
+    report["per_hour"] = {"reservations": buckets(RiaApiAttempt.reserved_at, 3600),
+        "http_attempts": buckets(RiaApiAttempt.transport_started_at, 3600)}
+    report["per_day"] = {"reservations": buckets(RiaApiAttempt.reserved_at, 86400),
+        "http_attempts": buckets(RiaApiAttempt.transport_started_at, 86400)}
+    reason = func.coalesce(RiaApiAuthorization.reason, "unknown")
+    rows = db.execute(select(reason, RiaApiAttempt.category, func.count())
+        .outerjoin(RiaApiAuthorization, RiaApiAttempt.id == RiaApiAuthorization.attempt_id)
+        .where(*criteria).group_by(reason, RiaApiAttempt.category)).all()
+    report["authorization_reasons"] = {}
+    report["initiators"] = {"user": 0, "background": 0, "unknown": 0}
+    for why, _, count in rows:
+        report["authorization_reasons"][why] = report["authorization_reasons"].get(why, 0) + count
+        report["initiators"]["unknown" if why == "unknown" else "user" if why in USER_REASONS else "background"] += count
+    report["most_expensive_operations"] = [{"authorization_reason": why, "category": kind,
+        "reservations": count} for why, kind, count in sorted(rows, key=lambda row: (-row[2], row[0], row[1]))[:20]]
+    report["forced_reservations"] = db.scalar(select(func.count()).select_from(RiaApiAttempt)
+        .where(*criteria, RiaApiAttempt.forced.is_(True))) or 0
+    report["cache_misses"] = None
+    report["usage_note"] = "Local reservations, dispatched operations and observed HTTP attempts are distinct; provider billing and cache hit/miss totals are not measured."
+    return report
 
 
 def authorization(reason, group):

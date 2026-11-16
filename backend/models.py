@@ -165,7 +165,8 @@ class ValuationPeer(Base):
 
 class FullScan(Base):
     __tablename__ = "full_scans"
-    __table_args__ = (UniqueConstraint("user_id", "fingerprint"),)
+    __table_args__ = (UniqueConstraint("user_id", "fingerprint"),
+                     Index("full_scan_shared_lookup", "fingerprint", "status", "updated_at"))
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     user_id: Mapped[int] = mapped_column(BigInteger, index=True)
     fingerprint: Mapped[str] = mapped_column(String(64))

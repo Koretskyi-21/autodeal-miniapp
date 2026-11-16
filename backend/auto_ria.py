@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .models import SourceProbe
+from .api_attempt_audit import authorization
 
 PROBE_ID = "auto-ria-connection-v1"
 
@@ -143,6 +144,8 @@ def listing_preview(data, requested_id):
 def probe_once(engine, key, fetch=fetch_json):
     if not key:
         return
+    from .ria_search import RiaSearch, initialize_budget
+    initialize_budget(engine)
     # Claim committed BEFORE any network request. The PK prevents duplicate calls
     # across processes/redeploys. A crash or failure never triggers an automatic retry.
     with Session(engine) as db:
@@ -153,30 +156,36 @@ def probe_once(engine, key, fetch=fetch_json):
             db.rollback()
             return
     result, status = {}, "error"
+    source = RiaSearch(engine, key, fetch)
+    source.request_policy = lambda *args: authorization("connection_check", PROBE_ID)
+    acquired = False
     try:
-        def request(method, params):
-            with Session(engine) as db:
-                row = db.get(SourceProbe, PROBE_ID)
-                row.requests += 1
-                db.commit()
-            return fetch(key, method, params)
+        source.acquire()
+        acquired = True
+        def request(method, params, parser):
+            # Diagnostic parser shapes must never populate production caches.
+            return source.request(method, params, parser, ttl=0, force=True)
 
-        source_id = first_id(request("search", {"category_id": 1, "searchType": 4,
+        source_id = request("search", {"category_id": 1, "searchType": 4,
                                                "status_id": 0, "countpage": 1,
-                                               "page": 0, "order_by": 7}))
+                                               "page": 0, "order_by": 7}, lambda raw: {"id": first_id(raw)})["id"]
         if source_id is None:
             status = "connected_empty"
         else:
-            result = listing_preview(request("info", {"auto_id": source_id}), source_id)
+            result = request("info", {"auto_id": source_id}, lambda raw: listing_preview(raw, source_id))
             status = "connected"
     except RiaError as exc:
         status = str(exc)
     except Exception:
         # Never log an upstream exception that could contain a credential.
         status = "check_failed"
+    finally:
+        if acquired:
+            source.release()
     with Session(engine) as db:
         row = db.get(SourceProbe, PROBE_ID)
         row.status, row.result, row.checked_at = status, result, time.time()
+        row.requests = source.requests_made
         db.commit()
 
 

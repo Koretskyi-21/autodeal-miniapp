@@ -9,6 +9,7 @@ from collections import Counter
 from datetime import datetime
 
 from . import poll_schedule
+from .cost_settings import active_interval
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -41,7 +42,7 @@ def night_paused(*, schedule_enabled=False, now=None):
 def poll_interval(*, schedule_enabled=False, now=None):
     # Keep durable retry waits bounded; the night gate prevents discovery even
     # when a saved deadline expires. Morning retiming resumes healthy waits.
-    return 3600 if night_paused(schedule_enabled=schedule_enabled, now=now) else INTERVAL
+    return max(3600, active_interval()) if night_paused(schedule_enabled=schedule_enabled, now=now) else active_interval()
 
 
 def reschedule(db, feed_ids):
@@ -99,7 +100,7 @@ def status(db, feed_ids, enabled, include_initial=False, *, schedule_enabled=Fal
             "paused": paused, "pause_reason": "night_schedule" if paused else None,
             "resume_local_time": "08:00" if paused else None,
             "include_initial": include_initial,
-            "window_size": WINDOW_SIZE, "interval_seconds": None if paused else INTERVAL,
+            "window_size": WINDOW_SIZE, "interval_seconds": None if paused else active_interval(),
             "maximum_candidates_per_poll": WINDOW_SIZE, "historical_pagination": False,
             "state_counts": dict(Counter(row.status for row in rows)) if enabled else {},
             "discovery_budget_available": bool(enabled and not paused and budget_available(db, reserve=1)),

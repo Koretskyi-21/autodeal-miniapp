@@ -14,7 +14,7 @@ import time
 import uuid
 from urllib.parse import urlsplit
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -22,8 +22,9 @@ from .auto_ria import RiaError, fetch_json, listing_preview
 from . import api_attempt_audit, paid_source_access
 from .ria_ai_price import fetch_quote as _default_ai_fetch
 from .models import Filters, SourceBudget, SourceCache, SourceProbe
-from .ria_budget import BudgetLimits, peer_scan_limit, total_cap
+from .ria_budget import BudgetLimits, peer_scan_limit, total_cap, background_limits
 from . import peer_cache
+from .cost_settings import peer_ttl
 from . import reference_valuation as reference
 from .valuation import DIMENSIONS, VERSION, PeerBatch, comparison_dimensions, estimate, is_deal, number, reasons, vehicle_key
 from .launch import source_added_at
@@ -38,6 +39,21 @@ CATALOG_PATHS = {"brands": "categories/1/marks", "regions": "states",
                  "transmission": "categories/1/gearboxes"}
 TRANSIENT_ERRORS = {"quota_exceeded", "busy", "search_limit", "connection_error", "upstream_error"}
 audit_log = logging.getLogger("autodeal.api_attempt_audit")
+
+
+def normalized_params(params):
+    """Canonical wire scalars; preserve indexed keys and sequence ordering."""
+    def scalar(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return str(int(value)) if int(value) == value else str(value)
+        if isinstance(value, dict):
+            return {key: scalar(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [scalar(item) for item in value]
+        return value
+    return scalar(params)
 
 
 def discovery_group_key(filters):
@@ -291,10 +307,11 @@ class RiaSearch:
         if not self.key:
             raise RiaError("not_configured")
         with Session(self.engine) as db:
-            row = db.scalar(select(SourceBudget).where(SourceBudget.id == "auto_ria").with_for_update())
-            if row.busy_until > time.time():
+            now = time.time()
+            claimed = db.execute(update(SourceBudget).where(SourceBudget.id == "auto_ria",
+                SourceBudget.busy_until <= now).values(owner=self.owner, busy_until=now + 90))
+            if not claimed.rowcount:
                 raise RiaError("busy")
-            row.owner, row.busy_until = self.owner, time.time() + 90
             db.commit()
             self._acquired = True
             self._discovery_cycle = {"active": True, "pages": {}, "locks": {}}
@@ -303,10 +320,9 @@ class RiaSearch:
         if self._borrowed:
             return
         with Session(self.engine) as db:
-            row = db.scalar(select(SourceBudget).where(SourceBudget.id == "auto_ria").with_for_update())
-            if row.owner == self.owner:
-                row.busy_until = 0
-                db.commit()
+            db.execute(update(SourceBudget).where(SourceBudget.id == "auto_ria",
+                       SourceBudget.owner == self.owner).values(busy_until=0))
+            db.commit()
         self._discovery_cycle["active"] = False
         self._acquired = False
 
@@ -333,7 +349,8 @@ class RiaSearch:
 
     def request(self, path, params, parser, ttl=900, *, force=False, fetcher=None, audited_fetcher=None):
         self.stage = path
-        cache_key = [path, params, "car-v5"] if path == "info" else [path, params]
+        canonical = normalized_params(params)
+        cache_key = [path, canonical, "car-v5"] if path == "info" else [path, canonical]
         digest = hashlib.sha256(json.dumps(cache_key, sort_keys=True).encode()).hexdigest()
         with self._budget_lock:
             lock = self._request_locks.setdefault(digest, threading.Lock())
@@ -351,10 +368,18 @@ class RiaSearch:
     def _request(self, path, params, parser, ttl, digest, *, force, fetcher, audited_fetcher):
         with self._budget_lock, Session(self.engine) as db:
             cached = db.get(SourceCache, digest)
-            if not force and cached and cached.expires_at > time.time():
+            cached_at = ((cached.payload or {}).get("__ria_cached_at", cached.expires_at - ttl) if cached else 0)
+            if not force and cached and min(cached.expires_at, cached_at + ttl) > time.time():
                 if ttl == FRESH_SECONDS:
-                    self.observed_at = min(self.observed_at, cached.expires_at - ttl)
-                return cached.payload
+                    self.observed_at = min(self.observed_at, cached_at)
+                if cached.payload is None or cached.payload.get("__ria_null_result") is True:
+                    return None
+                return {key: copy.deepcopy(value) for key, value in cached.payload.items() if key != "__ria_cached_at"}
+            claimed = db.execute(update(SourceBudget).where(SourceBudget.id == "auto_ria",
+                SourceBudget.owner == self.owner, SourceBudget.busy_until > time.time())
+                .values(total=SourceBudget.total))
+            if not claimed.rowcount:
+                raise RiaError("search_limit")
             row = db.scalar(select(SourceBudget).where(SourceBudget.id == "auto_ria").with_for_update())
             now = time.time()
             calls = [t for t in row.calls if t > now - 86400]
@@ -367,6 +392,9 @@ class RiaSearch:
             authorization_context = None
             if self.request_policy is not None:
                 authorization_context = self.request_policy(db, now, self.limits)
+            if (authorization_context and authorization_context["reason"] not in api_attempt_audit.USER_REASONS
+                    and budget_state(row, now, background_limits(self.limits), db=db)["reason"] != "available"):
+                raise RiaError("quota_exceeded")
             if paid_source_access.strict(self.engine) and not paid_source_access.any_eligible(db, now):
                 raise RiaError("paid_access_required")
             if paid_source_access.strict(self.engine) and authorization_context is None:
@@ -412,13 +440,26 @@ class RiaSearch:
         finally:
             with self._budget_lock:
                 self._lease_state["in_flight"] -= 1
+        cacheable = ttl > 0
+        if path == "search" and "ids" in payload and "total" in payload and "countpage" in params:
+            expected = min(int(params["countpage"]), max(0, payload["total"] - int(params.get("page", 0)) * int(params["countpage"])))
+            cacheable = cacheable and len(payload["ids"]) >= expected
+        if not cacheable:
+            if ttl > 0:
+                with self._budget_lock, Session(self.engine) as db:
+                    db.execute(delete(SourceCache).where(SourceCache.id == digest))
+                    db.commit()
+            self._audit_update(attempt_id, "success")
+            return payload
         with self._budget_lock, Session(self.engine) as db:
             db.execute(delete(SourceCache).where(SourceCache.expires_at < time.time()))
             row = db.get(SourceCache, digest)
             if row is None:
                 row = SourceCache(id=digest)
                 db.add(row)
-            row.payload, row.expires_at = payload, time.time() + ttl
+            stored_at = time.time()
+            stored = {"__ria_null_result": True} if payload is None else payload
+            row.payload, row.expires_at = {**stored, "__ria_cached_at": stored_at}, stored_at + ttl
             db.commit()
         self._audit_update(attempt_id, "success")
         return payload
@@ -580,6 +621,9 @@ class RiaSearch:
         car = self.request("info", {"auto_id": source_id}, lambda raw: parse_car(raw, source_id), force=force)
         return peer_cache.observe(self.engine, copy.deepcopy(car))
 
+    def peer_car(self, source_id):
+        return peer_cache.observation(self.engine, source_id) or self.car(source_id)
+
     def resolve_modification(self, car):
         """Recover only a unique full catalog label within the same generation/body."""
         if car.get("modification_id") or not car["comparable_condition"]:
@@ -628,14 +672,14 @@ class RiaSearch:
                           engineVolumeTo=candidate["engine_cc"] / 1000)
         else:
             params["modifications[0][0][0]"] = candidate["modification_id"]
-        result = self.request("search", params, parse_ids)
+        result = self.request("search", params, parse_ids, ttl=peer_ttl())
         known_ids = {peer["id"] for peer in peers} | {candidate["id"]}
         ids = [sid for sid in result["ids"] if sid not in known_ids]
         inspected = 0
         for source_id in ids[:self.peer_scan_limit]:
             inspected += 1
             try:
-                peer = self.car(source_id)
+                peer = self.peer_car(source_id)
                 # Spend catalog calls only on otherwise comparable peers, after
                 # loading the candidate cards and checking every known attribute.
                 if (all(peer.get(key) == candidate[key] for key in required if key != "modification_id")
@@ -702,12 +746,12 @@ class RiaSearch:
             if number(candidate.get("mileage")):
                 params.update(raceFrom=math.floor(max(0, candidate["mileage"] - tolerance) / 1000),
                               raceTo=math.ceil((candidate["mileage"] + tolerance) / 1000))
-            result = self.request("search", params, parse_ids)
+            result = self.request("search", params, parse_ids, ttl=peer_ttl())
             known_ids = {peer["id"] for peer in peers} | {candidate["id"]}
             ids = [sid for sid in result["ids"] if sid not in known_ids]
             for source_id in ids[:self.peer_scan_limit]:
                 try:
-                    peers.append(peer_cache.observe(self.engine, self.car(source_id), create=True))
+                    peers.append(peer_cache.observe(self.engine, self.peer_car(source_id), create=True))
                 except RiaError as exc:
                     if str(exc) not in {"listing_unavailable", "invalid_response"}:
                         raise

@@ -18,6 +18,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from . import billing, billing_campaign, paid_source_access, poll_schedule, tariff_reminders, tariff_reminder_commands
+from . import cost_settings, api_attempt_audit
 from . import manual_payments, manual_payment_routes, manual_checkout, manual_launch
 from .auth import telegram_user
 from .auto_ria import probe_once, probe_status
@@ -85,6 +86,7 @@ class Settings:
 
     @classmethod
     def env(cls):
+        cost_settings.validate()
         return cls(
             database_url=os.environ["DATABASE_URL"],
             bot_token=os.environ["TELEGRAM_BOT_TOKEN"],
@@ -102,7 +104,7 @@ class Settings:
             full_scan_enabled=os.getenv("FULL_SCAN_ENABLED") == "true",
             ria_diagnostic_listing_id=os.getenv("RIA_DIAGNOSTIC_LISTING_ID", ""),
             ria_recovery_listing_id=os.getenv("RIA_RECOVERY_LISTING_ID", ""),
-            ria_active_window_enabled=os.getenv("RIA_ACTIVE_WINDOW_ENABLED") == "true",
+            ria_active_window_enabled=cost_settings.active_enabled(),
             valuation_audit_run_id=os.getenv("VALUATION_AUDIT_RUN_ID", ""),
             auto_ria_user_id=os.getenv("AUTO_RIA_USER_ID", "").strip(),
             ria_ai_price_enabled=os.getenv("RIA_AI_PRICE_ENABLED") == "true",
@@ -140,6 +142,7 @@ class Settings:
 
 
 def create_app(settings: Settings, engine=None, *, paid_source_only=False):
+    cost_settings.validate()
     BudgetLimits.env()  # Validate before serving requests or running startup probes.
     poll_schedule.fixed_interval()
     peer_scan_limit()
@@ -411,6 +414,15 @@ def create_app(settings: Settings, engine=None, *, paid_source_only=False):
             result["paid_access_required"] = not billing.free_access_enabled(db)
             result["access_available"] = paid_source_access.allowed(db, uid)
         return result
+
+    @app.get("/api/admin/api-usage")
+    def api_usage(after: float = Query(ge=0), before: float = Query(ge=0),
+                  uid=Depends(identity), db=Depends(session)):
+        if not billing.verified_admin(settings) or uid != settings.admin_telegram_id:
+            raise HTTPException(403, "Forbidden")
+        if not after < before or before - after > 31 * 86400:
+            raise HTTPException(422, "Select a period of at most 31 days")
+        return api_attempt_audit.usage_report(db, after, before)
 
     @app.get("/api/billing/admin")
     def billing_admin_status(uid=Depends(identity), db=Depends(session)):

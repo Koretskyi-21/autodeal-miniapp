@@ -43,13 +43,14 @@ def test_increased_cap_wakes_quota_waits_without_resetting_accounting_or_checkpo
     assert len(p.calls)==before
 
 
-@pytest.mark.parametrize('gate',['upstream','hourly','daily','total'])
+@pytest.mark.parametrize('gate',['upstream','hourly','daily','total','interactive_reserve'])
 def test_remaining_budget_gates_cannot_be_bypassed(p,monkeypatch,gate):
     group,*_=arrange(p,monkeypatch)
     with Session(p.engine) as db:
         budget=db.get(SourceBudget,'auto_ria')
         if gate=='upstream': budget.blocked_until=p.clock[0]+3600
         if gate=='hourly': budget.calls=[p.clock[0]]*4500
+        if gate=='interactive_reserve': budget.calls=[p.clock[0]]*4050
         if gate=='daily': budget.calls=[p.clock[0]-4000]*90000
         if gate=='total': budget.total=102060
         db.commit()
